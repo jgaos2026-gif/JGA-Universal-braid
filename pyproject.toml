@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oasis-universal-braid"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=42,<46"]
+
+[project.scripts]
+oasis-braid = "universal_braid.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
