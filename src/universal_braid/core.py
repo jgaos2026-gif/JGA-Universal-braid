@@ -48,6 +48,132 @@ def unb64(value: str) -> bytes:
     return base64.b64decode(value, validate=True)
 
 
+def validate_public_identity(record: dict[str, Any]) -> dict[str, Any]:
+    """Validate an exchanged public identity without trusting its filename."""
+    if record.get("protocol") != PROTOCOL:
+        raise ValueError("wrong identity protocol")
+    if record.get("node_id") not in ALLOWED_NODES:
+        raise ValueError("unadmitted node identity")
+    if int(record.get("identity_epoch", 0)) < 1:
+        raise ValueError("invalid identity epoch")
+    public_key = unb64(record["public_key"])
+    if len(public_key) != 32:
+        raise ValueError("invalid Ed25519 public key")
+    if sha256(public_key) != record.get("fingerprint"):
+        raise ValueError("identity fingerprint mismatch")
+    return {
+        "protocol": PROTOCOL,
+        "node_id": record["node_id"],
+        "identity_epoch": int(record["identity_epoch"]),
+        "public_key": record["public_key"],
+        "fingerprint": record["fingerprint"],
+    }
+
+
+def import_peer(root: Path, identity: Identity, source: Path) -> dict[str, Any]:
+    peer = validate_public_identity(json.loads(source.read_text(encoding="utf-8")))
+    if peer["node_id"] == identity.node_id:
+        raise ValueError("refusing to import local identity as a peer")
+    path = root / "peers" / f'{peer["node_id"]}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        existing = validate_public_identity(json.loads(path.read_text(encoding="utf-8")))
+        if existing != peer:
+            raise FileExistsError("peer identity changed; explicit rotation is required")
+        return peer
+    path.write_text(json.dumps(peer, indent=2) + "\n", encoding="utf-8")
+    return peer
+
+
+def load_peer(root: Path, node_id: str) -> dict[str, Any]:
+    return validate_public_identity(json.loads(
+        (root / "peers" / f"{node_id}.json").read_text(encoding="utf-8")
+    ))
+
+
+def create_handshake_challenge(identity: Identity, peer: dict[str, Any], ttl: int = 300) -> dict[str, Any]:
+    now = utcnow()
+    body = {
+        "protocol": PROTOCOL,
+        "kind": "HANDSHAKE_CHALLENGE",
+        "session_id": str(uuid.uuid4()),
+        "source_node": identity.node_id,
+        "destination_node": peer["node_id"],
+        "nonce": secrets.token_hex(32),
+        "created_at": iso(now),
+        "expires_at": iso(now + timedelta(seconds=ttl)),
+        "signer_fingerprint": identity.fingerprint,
+    }
+    body["signature"] = identity.sign(canonical(body))
+    return body
+
+
+def _verify_signed_handshake(record: dict[str, Any], peer: dict[str, Any], local_node: str,
+                             expected_kind: str, now: datetime | None = None) -> None:
+    unsigned = dict(record)
+    signature = unb64(unsigned.pop("signature"))
+    if unsigned.get("protocol") != PROTOCOL or unsigned.get("kind") != expected_kind:
+        raise ValueError("wrong handshake protocol or kind")
+    if unsigned.get("source_node") != peer["node_id"]:
+        raise ValueError("wrong handshake source")
+    if unsigned.get("destination_node") != local_node:
+        raise ValueError("wrong handshake destination")
+    if unsigned.get("signer_fingerprint") != peer["fingerprint"]:
+        raise ValueError("wrong handshake fingerprint")
+    check_time = now or utcnow()
+    if parse_iso(unsigned["created_at"]) > check_time + timedelta(seconds=5):
+        raise ValueError("future handshake")
+    if parse_iso(unsigned["expires_at"]) < check_time:
+        raise ValueError("expired handshake")
+    Ed25519PublicKey.from_public_bytes(unb64(peer["public_key"])).verify(signature, canonical(unsigned))
+
+
+def respond_to_handshake(identity: Identity, peer: dict[str, Any], challenge: dict[str, Any]) -> dict[str, Any]:
+    _verify_signed_handshake(challenge, peer, identity.node_id, "HANDSHAKE_CHALLENGE")
+    body = {
+        "protocol": PROTOCOL,
+        "kind": "HANDSHAKE_RESPONSE",
+        "session_id": challenge["session_id"],
+        "source_node": identity.node_id,
+        "destination_node": peer["node_id"],
+        "nonce": challenge["nonce"],
+        "challenge_hash": sha256(canonical(challenge)),
+        "created_at": iso(utcnow()),
+        "expires_at": challenge["expires_at"],
+        "signer_fingerprint": identity.fingerprint,
+    }
+    body["signature"] = identity.sign(canonical(body))
+    return body
+
+
+def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, Any],
+                              challenge: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    if challenge.get("source_node") != identity.node_id:
+        raise ValueError("challenge was not issued by this node")
+    _verify_signed_handshake(response, peer, identity.node_id, "HANDSHAKE_RESPONSE")
+    if response.get("session_id") != challenge.get("session_id"):
+        raise ValueError("handshake session mismatch")
+    if response.get("nonce") != challenge.get("nonce"):
+        raise ValueError("handshake nonce mismatch")
+    if response.get("challenge_hash") != sha256(canonical(challenge)):
+        raise ValueError("handshake challenge mismatch")
+    result = {
+        "protocol": PROTOCOL,
+        "peer_node": peer["node_id"],
+        "peer_fingerprint": peer["fingerprint"],
+        "session_id": response["session_id"],
+        "verified_at": iso(utcnow()),
+        "authentication": "MUTUALLY_VERIFIED",
+        "connection": "OFFLINE",
+        "certification": "NOT_GRANTED",
+        "reason": "PENDING_INDEPENDENT_TRIAD",
+    }
+    path = root / "verifications" / f'{peer["node_id"]}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    return result
+
+
 @dataclass(frozen=True)
 class Identity:
     node_id: str

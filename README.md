@@ -29,6 +29,39 @@ Initial role names:
 
 The names are configuration, not proof. A node is admitted only after its machine identity and key material are verified.
 
+## Offline mutual-authentication ceremony
+
+Only `identity.json` is exchanged. `identity.pem` never leaves its machine.
+
+1. Import the other node's public identity on each machine:
+
+   ```powershell
+   oasis-braid --root C:\JGA\UniversalBraid peer-import --identity .\OTHER-NODE.identity.json
+   ```
+
+2. On Pavilion, create a fresh, short-lived challenge:
+
+   ```powershell
+   oasis-braid --root C:\JGA\UniversalBraid challenge-create --peer OASIS-THINKBOOK-01 --out .\pavilion-challenge.json
+   ```
+
+3. Transfer that challenge to ThinkBook and create its signed response:
+
+   ```powershell
+   oasis-braid --root C:\JGA\UniversalBraid challenge-respond --challenge .\pavilion-challenge.json --out .\thinkbook-response.json
+   ```
+
+4. Return the response to Pavilion and verify it against the exact challenge:
+
+   ```powershell
+   oasis-braid --root C:\JGA\UniversalBraid challenge-verify --challenge .\pavilion-challenge.json --response .\thinkbook-response.json
+   ```
+
+Repeat with ThinkBook as the challenger to prove both directions. A successful ceremony records
+`MUTUALLY_VERIFIED`, but deliberately leaves `connection=OFFLINE` and
+`certification=NOT_GRANTED`. Two participating nodes cannot satisfy the independent Triad
+certification rule by certifying each other.
+
 ## Connection handshake
 
 The human activation phrase is:

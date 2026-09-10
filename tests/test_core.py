@@ -1,7 +1,11 @@
 import copy
 from datetime import timedelta
 
-from universal_braid.core import EvidenceLedger, Verifier, create_identity, sign_challenge, sign_envelope, utcnow, verify_challenge
+from universal_braid.core import (
+    EvidenceLedger, Verifier, create_handshake_challenge, create_identity,
+    import_peer, respond_to_handshake, sign_challenge, sign_envelope, utcnow,
+    verify_challenge, verify_handshake_response,
+)
 
 
 def pair(tmp_path):
@@ -48,3 +52,35 @@ def test_tampered_ledger_fails(tmp_path):
     assert ledger.verify()
     ledger.path.write_text(ledger.path.read_text().replace("negative.test", "erased.test"))
     assert not ledger.verify()
+
+
+def test_offline_mutual_handshake_is_verified_but_not_certified(tmp_path):
+    a_root, b_root = tmp_path / "a", tmp_path / "b"
+    a = create_identity(a_root, "OASIS-PAVILION-01")
+    b = create_identity(b_root, "OASIS-THINKBOOK-01")
+    a_peer = import_peer(a_root, a, b_root / "identity.json")
+    b_peer = import_peer(b_root, b, a_root / "identity.json")
+    challenge = create_handshake_challenge(a, a_peer)
+    response = respond_to_handshake(b, b_peer, challenge)
+    result = verify_handshake_response(a_root, a, a_peer, challenge, response)
+    assert result["authentication"] == "MUTUALLY_VERIFIED"
+    assert result["connection"] == "OFFLINE"
+    assert result["certification"] == "NOT_GRANTED"
+    assert result["reason"] == "PENDING_INDEPENDENT_TRIAD"
+
+
+def test_tampered_handshake_response_fails(tmp_path):
+    a_root, b_root = tmp_path / "a", tmp_path / "b"
+    a = create_identity(a_root, "OASIS-PAVILION-01")
+    b = create_identity(b_root, "OASIS-THINKBOOK-01")
+    a_peer = import_peer(a_root, a, b_root / "identity.json")
+    b_peer = import_peer(b_root, b, a_root / "identity.json")
+    challenge = create_handshake_challenge(a, a_peer)
+    response = respond_to_handshake(b, b_peer, challenge)
+    response["nonce"] = "altered"
+    try:
+        verify_handshake_response(a_root, a, a_peer, challenge, response)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("tampered handshake response was accepted")
