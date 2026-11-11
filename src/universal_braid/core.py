@@ -259,40 +259,131 @@ def load_identity(root: Path) -> Identity:
 
 
 class EvidenceLedger:
+    """Hash-linked, fail-closed evidence ledger with cross-process append serialization."""
+
     def __init__(self, path: Path):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    def head(self) -> str:
-        if not self.path.exists() or not self.path.stat().st_size:
-            return "0" * 64
-        last = self.path.read_text().splitlines()[-1]
-        return json.loads(last)["entry_hash"]
+    def _acquire_lock(self) -> Path:
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    os.write(fd, canonical({"pid": os.getpid(), "created_at": iso(utcnow())}))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                return lock_path
+            except FileExistsError:
+                try:
+                    if time.time() - lock_path.stat().st_mtime > 120.0:
+                        lock_path.unlink()
+                        continue
+                except FileNotFoundError:
+                    continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("EVIDENCE_LEDGER_LOCK_TIMEOUT: another writer holds the ledger lock")
+                time.sleep(0.025)
 
-    def append(self, event: str, outcome: str, details: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _release_lock(lock_path: Path) -> None:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _read_verified_records(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        raw = self.path.read_text(encoding="utf-8")
+        if raw and not raw.endswith("\n"):
+            raise ValueError("EVIDENCE_LEDGER_CORRUPT: incomplete final record")
+        records: list[dict[str, Any]] = []
+        previous = ZERO_HASH
+        for line_number, line in enumerate(raw.splitlines(), start=1):
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise ValueError(f"EVIDENCE_LEDGER_CORRUPT: invalid JSON at line {line_number}") from exc
+            if not isinstance(record, dict) or not isinstance(record.get("entry_hash"), str):
+                raise ValueError(f"EVIDENCE_LEDGER_CORRUPT: malformed record at line {line_number}")
+            claimed = record["entry_hash"]
+            unsigned = {key: value for key, value in record.items() if key != "entry_hash"}
+            if unsigned.get("previous_hash") != previous or sha256(canonical(unsigned)) != claimed:
+                raise ValueError(f"EVIDENCE_LEDGER_CORRUPT: hash-chain mismatch at line {line_number}")
+            records.append(record)
+            previous = claimed
+        return records
+
+    def _append_locked(self, event: str, outcome: str, details: dict[str, Any],
+                       records: list[dict[str, Any]]) -> dict[str, Any]:
         record = {
             "event_id": str(uuid.uuid4()), "created_at": iso(utcnow()),
             "event": event, "outcome": outcome, "details": details,
-            "previous_hash": self.head(),
+            "previous_hash": records[-1]["entry_hash"] if records else ZERO_HASH,
         }
         record["entry_hash"] = sha256(canonical(record))
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(str(self.path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(fd, payload[offset:])
+                if written <= 0:
+                    raise OSError("short write while appending evidence ledger")
+                offset += written
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         return record
 
-    def verify(self) -> bool:
-        previous = "0" * 64
-        if not self.path.exists():
-            return True
-        for line in self.path.read_text().splitlines():
-            record = json.loads(line)
-            claimed = record.pop("entry_hash")
-            if record["previous_hash"] != previous or sha256(canonical(record)) != claimed:
+    def head(self) -> str:
+        lock = self._acquire_lock()
+        try:
+            records = self._read_verified_records()
+            return records[-1]["entry_hash"] if records else ZERO_HASH
+        finally:
+            self._release_lock(lock)
+
+    def append(self, event: str, outcome: str, details: dict[str, Any]) -> dict[str, Any]:
+        lock = self._acquire_lock()
+        try:
+            records = self._read_verified_records()
+            return self._append_locked(event, outcome, details, records)
+        finally:
+            self._release_lock(lock)
+
+    def append_unique(self, event: str, field: str, value: str,
+                      details: dict[str, Any]) -> bool:
+        """Atomically append PASS once per event/detail key; persist FAIL on replay."""
+        lock = self._acquire_lock()
+        try:
+            records = self._read_verified_records()
+            duplicate = any(
+                record.get("event") == event and record.get("outcome") == "PASS" and
+                isinstance(record.get("details"), dict) and record["details"].get(field) == value
+                for record in records
+            )
+            if duplicate:
+                self._append_locked(event, "FAIL", {**details, "reason": "replay"}, records)
                 return False
-            previous = claimed
-        return True
+            self._append_locked(event, "PASS", details, records)
+            return True
+        finally:
+            self._release_lock(lock)
+
+    def verify(self) -> bool:
+        lock = self._acquire_lock()
+        try:
+            self._read_verified_records()
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
+        finally:
+            self._release_lock(lock)
 
 
 def sign_envelope(identity: Identity, destination: str, session_id: str, payload: Any,
