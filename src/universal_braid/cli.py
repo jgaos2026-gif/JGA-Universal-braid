@@ -77,8 +77,15 @@ def main() -> None:
         challenge_record = json.loads(args.challenge.read_text(encoding="utf-8"))
         response_record = json.loads(args.response.read_text(encoding="utf-8"))
         peer = load_peer(args.root, response_record["source_node"])
-        result = verify_handshake_response(args.root, identity, peer, challenge_record, response_record)
-        ledger.append("handshake.response.verify", "PASS", result)
+        try:
+            result = verify_handshake_response(args.root, identity, peer, challenge_record, response_record, ledger)
+        except Exception as exc:
+            ledger.append("handshake.response.verify", "FAIL", {
+                "peer": peer["node_id"],
+                "session_id": challenge_record.get("session_id"),
+                "reason": str(exc) or type(exc).__name__,
+            })
+            raise
         print(json.dumps(result, indent=2))
     else:
         identity = load_identity(args.root)
