@@ -154,6 +154,14 @@ def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, An
         raise ValueError("challenge was not issued by this node")
     if challenge.get("destination_node") != identity.node_id:
         raise ValueError("challenge destination mismatch")
+    # Verify the challenge was genuinely issued by this local identity.
+    challenge_unsigned = dict(challenge)
+    challenge_signature = unb64(challenge_unsigned.pop("signature"))
+    if challenge_unsigned.get("signer_fingerprint") != identity.fingerprint:
+        raise ValueError("challenge signer fingerprint mismatch")
+    Ed25519PublicKey.from_public_bytes(identity.public_bytes).verify(
+        challenge_signature, canonical(challenge_unsigned)
+    )
     ledger = EvidenceLedger(root / "evidence.jsonl")
     session_id = response.get("session_id")
     _verify_signed_handshake(response, peer, identity.node_id, "HANDSHAKE_RESPONSE")
@@ -215,6 +223,8 @@ class Identity:
 def create_identity(root: Path, node_id: str, epoch: int = 1) -> Identity:
     if node_id not in ALLOWED_NODES:
         raise ValueError("node_id is not an admitted initial Control Room")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        raise ValueError("identity epoch must be a positive integer")
     root.mkdir(parents=True, exist_ok=True)
     private_path = root / "identity.pem"
     if private_path.exists():
