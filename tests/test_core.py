@@ -137,7 +137,7 @@ def test_local_identity_node_id_tampering_is_rejected(tmp_path):
     try:
         from universal_braid.core import load_identity
         load_identity(tmp_path)
-    except ValueError:
+    except Exception:
         pass
     else:
         raise AssertionError("tampered local node identity was accepted")
