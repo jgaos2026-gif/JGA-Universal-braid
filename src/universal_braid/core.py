@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -254,25 +255,74 @@ class EvidenceLedger:
     def __init__(self, path: Path):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_path = path.with_suffix(path.suffix + ".lock")
 
-    def records(self) -> list[dict[str, Any]]:
-        if not self.verify():
-            raise ValueError("EVIDENCE_LEDGER_CORRUPT: refusing to read unverified history")
+    @contextmanager
+    def _locked(self):
+        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        locked = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+            yield
+        finally:
+            if locked:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _read_verified_unlocked(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
-        return [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        previous = "0" * 64
+        records: list[dict[str, Any]] = []
+        try:
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    raise ValueError("blank ledger line")
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("ledger entry is not an object")
+                claimed = record.get("entry_hash")
+                unsigned = {key: value for key, value in record.items() if key != "entry_hash"}
+                if not isinstance(claimed, str) or unsigned.get("previous_hash") != previous:
+                    raise ValueError("ledger chain link mismatch")
+                if sha256(canonical(unsigned)) != claimed:
+                    raise ValueError("ledger entry hash mismatch")
+                previous = claimed
+                records.append(record)
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError("EVIDENCE_LEDGER_CORRUPT: " + str(exc)) from exc
+        return records
+
+    def records(self) -> list[dict[str, Any]]:
+        with self._locked():
+            return self._read_verified_unlocked()
 
     def head(self) -> str:
-        records = self.records()
-        return records[-1]["entry_hash"] if records else "0" * 64
+        with self._locked():
+            records = self._read_verified_unlocked()
+            return records[-1]["entry_hash"] if records else "0" * 64
 
-    def append(self, event: str, outcome: str, details: dict[str, Any]) -> dict[str, Any]:
-        if not self.verify():
-            raise ValueError("EVIDENCE_LEDGER_CORRUPT: refusing append")
+    def _append_unlocked(self, event: str, outcome: str, details: dict[str, Any]) -> dict[str, Any]:
+        records = self._read_verified_unlocked()
         record = {
             "event_id": str(uuid.uuid4()), "created_at": iso(utcnow()),
             "event": event, "outcome": outcome, "details": details,
-            "previous_hash": self.head(),
+            "previous_hash": records[-1]["entry_hash"] if records else "0" * 64,
         }
         record["entry_hash"] = sha256(canonical(record))
         with self.path.open("a", encoding="utf-8") as handle:
@@ -281,28 +331,37 @@ class EvidenceLedger:
             os.fsync(handle.fileno())
         return record
 
-    def verify(self) -> bool:
-        previous = "0" * 64
-        if not self.path.exists():
-            return True
-        try:
-            for line in self.path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    return False
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    return False
-                claimed = record.get("entry_hash")
-                unsigned = {key: value for key, value in record.items() if key != "entry_hash"}
-                if not isinstance(claimed, str) or unsigned.get("previous_hash") != previous:
-                    return False
-                if sha256(canonical(unsigned)) != claimed:
-                    return False
-                previous = claimed
-            return True
-        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-            return False
+    def append(self, event: str, outcome: str, details: dict[str, Any]) -> dict[str, Any]:
+        with self._locked():
+            return self._append_unlocked(event, outcome, details)
 
+    def append_once(self, event: str, unique_fields: dict[str, Any],
+                    details: dict[str, Any]) -> bool:
+        """Atomically persist one accepted event for a unique identity tuple."""
+        with self._locked():
+            records = self._read_verified_unlocked()
+            replay = any(
+                record.get("event") == event
+                and record.get("outcome") == "PASS"
+                and all(record.get("details", {}).get(key) == value
+                        for key, value in unique_fields.items())
+                for record in records
+            )
+            if replay:
+                self._append_unlocked(event, "FAIL", {
+                    **details, "reason": "replay", "replayed_fields": unique_fields
+                })
+                return False
+            self._append_unlocked(event, "PASS", details)
+            return True
+
+    def verify(self) -> bool:
+        try:
+            with self._locked():
+                self._read_verified_unlocked()
+            return True
+        except (OSError, ValueError):
+            return False
 def sign_envelope(identity: Identity, destination: str, session_id: str, payload: Any,
                   branch: str = "control-room", family: str = "INTEG",
                   capability: str = "braid.exchange", ttl: int = 30,
