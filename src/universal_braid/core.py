@@ -169,16 +169,29 @@ def respond_to_handshake(identity: Identity, peer: dict[str, Any], challenge: di
 
 
 def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, Any],
-                              challenge: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+                              challenge: dict[str, Any], response: dict[str, Any],
+                              ledger: "EvidenceLedger | None" = None) -> dict[str, Any]:
+    peer = validate_public_identity(peer)
     if challenge.get("source_node") != identity.node_id:
         raise ValueError("challenge was not issued by this node")
+    if challenge.get("destination_node") != peer["node_id"]:
+        raise ValueError("challenge targets a different peer")
+    _verify_signed_handshake(challenge, identity.public_record(), peer["node_id"], "HANDSHAKE_CHALLENGE")
     _verify_signed_handshake(response, peer, identity.node_id, "HANDSHAKE_RESPONSE")
     if response.get("session_id") != challenge.get("session_id"):
         raise ValueError("handshake session mismatch")
     if response.get("nonce") != challenge.get("nonce"):
         raise ValueError("handshake nonce mismatch")
-    if response.get("challenge_hash") != sha256(canonical(challenge)):
+    challenge_hash = sha256(canonical(challenge))
+    if response.get("challenge_hash") != challenge_hash:
         raise ValueError("handshake challenge mismatch")
+    event_ledger = ledger or EvidenceLedger(root / "evidence.jsonl")
+    accepted = event_ledger.append_unique(
+        "handshake.response.verify", "session_id", response["session_id"],
+        {"peer": peer["node_id"], "session_id": response["session_id"], "challenge_hash": challenge_hash}
+    )
+    if not accepted:
+        raise ValueError("handshake replay: session has already been consumed")
     result = {
         "protocol": PROTOCOL,
         "peer_node": peer["node_id"],
@@ -192,7 +205,12 @@ def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, An
     }
     path = root / "verifications" / f'{peer["node_id"]}.json'
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    temp_path = path.with_name(path.name + "." + str(uuid.uuid4()) + ".tmp")
+    with temp_path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(result, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
     return result
 
 
