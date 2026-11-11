@@ -203,7 +203,12 @@ def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, An
         raise ValueError("handshake replay refused")
     path = root / "verifications" / f'{peer["node_id"]}.json'
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    temp_path = path.with_name(path.name + "." + str(uuid.uuid4()) + ".tmp")
+    with temp_path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(result, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
     return result
 
 @dataclass(frozen=True)
@@ -309,7 +314,10 @@ class EvidenceLedger:
         previous = "0" * 64
         records: list[dict[str, Any]] = []
         try:
-            for line in self.path.read_text(encoding="utf-8").splitlines():
+            raw = self.path.read_text(encoding="utf-8")
+            if raw and not raw.endswith("\n"):
+                raise ValueError("incomplete final record")
+            for line in raw.splitlines():
                 if not line.strip():
                     raise ValueError("blank ledger line")
                 record = json.loads(line)
@@ -385,6 +393,8 @@ def sign_envelope(identity: Identity, destination: str, session_id: str, payload
                   branch: str = "control-room", family: str = "INTEG",
                   capability: str = "braid.exchange", ttl: int = 30,
                   message_id: str | None = None, created_at: datetime | None = None) -> dict[str, Any]:
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 1 <= ttl <= MAX_HANDSHAKE_TTL_SECONDS:
+        raise ValueError("message TTL must be an integer from 1 to 300 seconds")
     now = created_at or utcnow()
     body = {
         "protocol": PROTOCOL, "message_id": message_id or str(uuid.uuid4()),
@@ -431,7 +441,13 @@ class Verifier:
             if sha256(canonical(unsigned.get("payload"))) != unsigned.get("payload_hash"): raise ValueError("altered_payload")
             check_time = now or utcnow()
             if parse_iso(unsigned["created_at"]) > check_time + timedelta(seconds=5): raise ValueError("future_message")
-            if parse_iso(unsigned["expires_at"]) < check_time: raise ValueError("expired")
+            expires = parse_iso(unsigned["expires_at"])
+            created = parse_iso(unsigned["created_at"])
+            if expires <= check_time: raise ValueError("expired")
+            lifetime = (expires - created).total_seconds()
+            if lifetime <= 0 or lifetime > MAX_HANDSHAKE_TTL_SECONDS: raise ValueError("invalid_message_ttl")
+            if not isinstance(unsigned.get("capability"), str) or not unsigned["capability"].strip() or len(unsigned["capability"]) > 128:
+                raise ValueError("invalid_capability")
             message_id = unsigned.get("message_id")
             nonce = unsigned.get("nonce")
             if not isinstance(message_id, str) or not message_id: raise ValueError("missing_message_id")
