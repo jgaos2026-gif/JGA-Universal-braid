@@ -167,3 +167,24 @@ def test_tampered_local_challenge_is_rejected(tmp_path):
         pass
     else:
         raise AssertionError("tampered local challenge was accepted")
+
+
+def test_handshake_and_envelope_ttl_are_bounded(tmp_path):
+    a_root, b_root = tmp_path / "a", tmp_path / "b"
+    a = create_identity(a_root, "OASIS-PAVILION-01")
+    b = create_identity(b_root, "OASIS-THINKBOOK-01")
+    a_peer = import_peer(a_root, a, b_root / "identity.json")
+    for ttl in (0, -1, 301, True):
+        try:
+            create_handshake_challenge(a, a_peer, ttl=ttl)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid handshake TTL accepted: {ttl!r}")
+    for ttl in (0, -1, 301, True):
+        try:
+            sign_envelope(a, b.node_id, "ttl-test", {}, ttl=ttl)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid envelope TTL accepted: {ttl!r}")
