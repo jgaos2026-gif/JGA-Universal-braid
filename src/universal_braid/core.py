@@ -19,6 +19,7 @@ PROTOCOL = "OASIS-BRAID-1"
 ALLOWED_NODES = {"OASIS-PAVILION-01", "OASIS-THINKBOOK-01"}
 ALLOWED_BRANCHES = {"control-room", "trench-city"}
 ALLOWED_FAMILIES = {"INTEG", "ROUTE", "RECOV", "ROLE", "AUTH", "MEM"}
+MAX_HANDSHAKE_TTL_SECONDS = 300
 
 
 def utcnow() -> datetime:
@@ -95,7 +96,12 @@ def load_peer(root: Path, node_id: str) -> dict[str, Any]:
     ))
 
 
-def create_handshake_challenge(identity: Identity, peer: dict[str, Any], ttl: int = 300) -> dict[str, Any]:
+def create_handshake_challenge(identity: Identity, peer: dict[str, Any], ttl: int = MAX_HANDSHAKE_TTL_SECONDS) -> dict[str, Any]:
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 1 <= ttl <= MAX_HANDSHAKE_TTL_SECONDS:
+        raise ValueError("handshake TTL must be an integer from 1 to 300 seconds")
+    peer = validate_public_identity(peer)
+    if peer["node_id"] == identity.node_id:
+        raise ValueError("refusing a handshake with the local identity")
     now = utcnow()
     body = {
         "protocol": PROTOCOL,
@@ -103,6 +109,7 @@ def create_handshake_challenge(identity: Identity, peer: dict[str, Any], ttl: in
         "session_id": str(uuid.uuid4()),
         "source_node": identity.node_id,
         "destination_node": peer["node_id"],
+        "identity_epoch": identity.identity_epoch,
         "nonce": secrets.token_hex(32),
         "created_at": iso(now),
         "expires_at": iso(now + timedelta(seconds=ttl)),
@@ -124,11 +131,22 @@ def _verify_signed_handshake(record: dict[str, Any], peer: dict[str, Any], local
         raise ValueError("wrong handshake destination")
     if unsigned.get("signer_fingerprint") != peer["fingerprint"]:
         raise ValueError("wrong handshake fingerprint")
+    if unsigned.get("identity_epoch") != peer["identity_epoch"]:
+        raise ValueError("wrong handshake identity epoch")
     check_time = now or utcnow()
-    if parse_iso(unsigned["created_at"]) > check_time + timedelta(seconds=5):
+    created = parse_iso(unsigned["created_at"])
+    expires = parse_iso(unsigned["expires_at"])
+    if created > check_time + timedelta(seconds=5):
         raise ValueError("future handshake")
-    if parse_iso(unsigned["expires_at"]) < check_time:
+    if expires <= check_time:
         raise ValueError("expired handshake")
+    lifetime = (expires - created).total_seconds()
+    if lifetime <= 0 or lifetime > MAX_HANDSHAKE_TTL_SECONDS:
+        raise ValueError("handshake validity window exceeds policy")
+    if not isinstance(unsigned.get("session_id"), str) or not unsigned["session_id"]:
+        raise ValueError("missing handshake session id")
+    if not isinstance(unsigned.get("nonce"), str) or len(unsigned["nonce"]) != 64:
+        raise ValueError("invalid handshake nonce")
     Ed25519PublicKey.from_public_bytes(unb64(peer["public_key"])).verify(signature, canonical(unsigned))
 
 
@@ -140,6 +158,7 @@ def respond_to_handshake(identity: Identity, peer: dict[str, Any], challenge: di
         "session_id": challenge["session_id"],
         "source_node": identity.node_id,
         "destination_node": peer["node_id"],
+        "identity_epoch": identity.identity_epoch,
         "nonce": challenge["nonce"],
         "challenge_hash": sha256(canonical(challenge)),
         "created_at": iso(utcnow()),
@@ -157,14 +176,7 @@ def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, An
         raise ValueError("challenge was not issued by this node")
     if challenge.get("destination_node") != peer["node_id"]:
         raise ValueError("challenge destination mismatch")
-    # Verify the challenge was genuinely issued by this local identity.
-    challenge_unsigned = dict(challenge)
-    challenge_signature = unb64(challenge_unsigned.pop("signature"))
-    if challenge_unsigned.get("signer_fingerprint") != identity.fingerprint:
-        raise ValueError("challenge signer fingerprint mismatch")
-    Ed25519PublicKey.from_public_bytes(identity.public_bytes).verify(
-        challenge_signature, canonical(challenge_unsigned)
-    )
+    _verify_signed_handshake(challenge, identity.public_record(), peer["node_id"], "HANDSHAKE_CHALLENGE")
     ledger = EvidenceLedger(root / "evidence.jsonl")
     session_id = response.get("session_id")
     _verify_signed_handshake(response, peer, identity.node_id, "HANDSHAKE_RESPONSE")
