@@ -78,7 +78,6 @@ def main() -> None:
         response_record = json.loads(args.response.read_text(encoding="utf-8"))
         peer = load_peer(args.root, response_record["source_node"])
         result = verify_handshake_response(args.root, identity, peer, challenge_record, response_record)
-        ledger.append("handshake.response.verify", "PASS", result)
         print(json.dumps(result, indent=2))
     else:
         identity = load_identity(args.root)

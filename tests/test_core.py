@@ -84,3 +84,60 @@ def test_tampered_handshake_response_fails(tmp_path):
         pass
     else:
         raise AssertionError("tampered handshake response was accepted")
+
+
+def test_envelope_replay_survives_verifier_restart(tmp_path):
+    a, b, ledger, verifier = pair(tmp_path)
+    message = sign_envelope(a, b.node_id, "session-restart", {"kind": "heartbeat"})
+    assert verifier.verify(message)
+    restarted = Verifier(b.node_id, a.public_record(), EvidenceLedger(ledger.path))
+    assert not restarted.verify(message)
+    assert EvidenceLedger(ledger.path).verify()
+
+
+def test_ledger_refuses_to_append_after_tampering(tmp_path):
+    _, _, ledger, _ = pair(tmp_path)
+    ledger.append("baseline", "PASS", {"ok": True})
+    raw = ledger.path.read_text()
+    ledger.path.write_text(raw.replace('"baseline"', '"tampered"'))
+    assert not ledger.verify()
+    try:
+        ledger.append("after_tamper", "PASS", {})
+    except ValueError as exc:
+        assert "EVIDENCE_LEDGER_CORRUPT" in str(exc)
+    else:
+        raise AssertionError("append to corrupted ledger was accepted")
+
+
+def test_handshake_response_replay_survives_restart(tmp_path):
+    a_root, b_root = tmp_path / "a", tmp_path / "b"
+    a = create_identity(a_root, "OASIS-PAVILION-01")
+    b = create_identity(b_root, "OASIS-THINKBOOK-01")
+    a_peer = import_peer(a_root, a, b_root / "identity.json")
+    b_peer = import_peer(b_root, b, a_root / "identity.json")
+    challenge = create_handshake_challenge(a, a_peer)
+    response = respond_to_handshake(b, b_peer, challenge)
+    result = verify_handshake_response(a_root, a, a_peer, challenge, response)
+    assert result["authentication"] == "MUTUALLY_VERIFIED"
+    try:
+        verify_handshake_response(a_root, a, a_peer, challenge, response)
+    except ValueError as exc:
+        assert "replay" in str(exc)
+    else:
+        raise AssertionError("replayed handshake response was accepted")
+    assert EvidenceLedger(a_root / "evidence.jsonl").verify()
+
+
+def test_local_identity_node_id_tampering_is_rejected(tmp_path):
+    create_identity(tmp_path, "OASIS-PAVILION-01")
+    record_path = tmp_path / "identity.json"
+    record = __import__("json").loads(record_path.read_text())
+    record["node_id"] = "OASIS-THINKBOOK-01"
+    record_path.write_text(__import__("json").dumps(record))
+    try:
+        from universal_braid.core import load_identity
+        load_identity(tmp_path)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("tampered local node identity was accepted")
