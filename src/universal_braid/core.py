@@ -431,29 +431,48 @@ class Verifier:
         self.seen: set[str] = set()
 
     def verify(self, envelope: dict[str, Any], now: datetime | None = None) -> bool:
-        reason = "accepted"
         try:
+            if not self.ledger.verify():
+                return False
             unsigned = dict(envelope)
             signature = unb64(unsigned.pop("signature"))
             if unsigned.get("protocol") != PROTOCOL: raise ValueError("wrong_protocol")
             if unsigned.get("destination_node") != self.local_node: raise ValueError("wrong_destination")
             if unsigned.get("source_node") != self.peer["node_id"]: raise ValueError("wrong_source")
             if unsigned.get("signer_fingerprint") != self.peer["fingerprint"]: raise ValueError("wrong_fingerprint")
+            if unsigned.get("identity_epoch") != self.peer["identity_epoch"]: raise ValueError("wrong_identity_epoch")
             if unsigned.get("branch") not in ALLOWED_BRANCHES: raise ValueError("wrong_scope")
             if unsigned.get("family") not in ALLOWED_FAMILIES: raise ValueError("wrong_family")
+            if not isinstance(unsigned.get("capability"), str) or not unsigned["capability"].strip() or len(unsigned["capability"]) > 128:
+                raise ValueError("invalid_capability")
             if sha256(canonical(unsigned.get("payload"))) != unsigned.get("payload_hash"): raise ValueError("altered_payload")
             check_time = now or utcnow()
-            if parse_iso(unsigned["created_at"]) > check_time + timedelta(seconds=5): raise ValueError("future_message")
-            if parse_iso(unsigned["expires_at"]) < check_time: raise ValueError("expired")
-            if unsigned["message_id"] in self.seen: raise ValueError("replay")
+            created = parse_iso(unsigned["created_at"])
+            expires = parse_iso(unsigned["expires_at"])
+            if created > check_time + timedelta(seconds=5): raise ValueError("future_message")
+            if expires <= check_time: raise ValueError("expired")
+            lifetime = (expires - created).total_seconds()
+            if lifetime <= 0 or lifetime > MAX_HANDSHAKE_TTL_SECONDS: raise ValueError("invalid_message_ttl")
+            if not isinstance(unsigned.get("nonce"), str) or len(unsigned["nonce"]) != 32: raise ValueError("invalid_nonce")
+            if not isinstance(unsigned.get("message_id"), str) or not unsigned["message_id"]: raise ValueError("invalid_message_id")
             pub = Ed25519PublicKey.from_public_bytes(unb64(self.peer["public_key"]))
             pub.verify(signature, canonical(unsigned))
+            accepted = self.ledger.append_unique(
+                "envelope.verify", "message_id", unsigned["message_id"],
+                {"message_id": unsigned["message_id"], "session_id": unsigned.get("session_id")}
+            )
+            if not accepted:
+                return False
             self.seen.add(unsigned["message_id"])
-            self.ledger.append("envelope.verify", "PASS", {"message_id": unsigned["message_id"]})
             return True
         except Exception as exc:
             reason = str(exc) or type(exc).__name__
-            self.ledger.append("envelope.verify", "FAIL", {"message_id": envelope.get("message_id"), "reason": reason})
+            try:
+                self.ledger.append("envelope.verify", "FAIL", {
+                    "message_id": envelope.get("message_id"), "reason": reason
+                })
+            except Exception:
+                pass
             return False
 
 
