@@ -50,27 +50,30 @@ def unb64(value: str) -> bytes:
 
 
 def validate_public_identity(record: dict[str, Any]) -> dict[str, Any]:
-    """Validate an exchanged public identity without trusting its filename."""
-    if record.get("protocol") != PROTOCOL:
+    """Validate the public identity and its self-signature."""
+    if not isinstance(record, dict) or record.get("protocol") != PROTOCOL:
         raise ValueError("wrong identity protocol")
     if record.get("node_id") not in ALLOWED_NODES:
         raise ValueError("unadmitted node identity")
-    if int(record.get("identity_epoch", 0)) < 1:
+    epoch = record.get("identity_epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
         raise ValueError("invalid identity epoch")
     public_key = unb64(record["public_key"])
     if len(public_key) != 32:
         raise ValueError("invalid Ed25519 public key")
-    if sha256(public_key) != record.get("fingerprint"):
+    fingerprint = sha256(public_key)
+    if fingerprint != record.get("fingerprint"):
         raise ValueError("identity fingerprint mismatch")
-    return {
+    normalized = {
         "protocol": PROTOCOL,
         "node_id": record["node_id"],
-        "identity_epoch": int(record["identity_epoch"]),
+        "identity_epoch": epoch,
         "public_key": record["public_key"],
-        "fingerprint": record["fingerprint"],
+        "fingerprint": fingerprint,
     }
-
-
+    signature = unb64(record["identity_signature"])
+    Ed25519PublicKey.from_public_bytes(public_key).verify(signature, canonical(normalized))
+    return {**normalized, "identity_signature": record["identity_signature"]}
 def import_peer(root: Path, identity: Identity, source: Path) -> dict[str, Any]:
     peer = validate_public_identity(json.loads(source.read_text(encoding="utf-8")))
     if peer["node_id"] == identity.node_id:
@@ -152,7 +155,7 @@ def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, An
     peer = validate_public_identity(peer)
     if challenge.get("source_node") != identity.node_id:
         raise ValueError("challenge was not issued by this node")
-    if challenge.get("destination_node") != identity.node_id:
+    if challenge.get("destination_node") != peer["node_id"]:
         raise ValueError("challenge destination mismatch")
     # Verify the challenge was genuinely issued by this local identity.
     challenge_unsigned = dict(challenge)
@@ -211,13 +214,14 @@ class Identity:
         return b64(self.private_key.sign(body))
 
     def public_record(self) -> dict[str, Any]:
-        return {
+        body = {
             "protocol": PROTOCOL,
             "node_id": self.node_id,
             "identity_epoch": self.identity_epoch,
             "public_key": b64(self.public_bytes),
             "fingerprint": self.fingerprint,
         }
+        return {**body, "identity_signature": self.sign(canonical(body))}
 
 
 def create_identity(root: Path, node_id: str, epoch: int = 1) -> Identity:
