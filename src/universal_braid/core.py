@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import secrets
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,8 @@ PROTOCOL = "OASIS-BRAID-1"
 ALLOWED_NODES = {"OASIS-PAVILION-01", "OASIS-THINKBOOK-01"}
 ALLOWED_BRANCHES = {"control-room", "trench-city"}
 ALLOWED_FAMILIES = {"INTEG", "ROUTE", "RECOV", "ROLE", "AUTH", "MEM"}
+MAX_HANDSHAKE_TTL_SECONDS = 300
+ZERO_HASH = "0" * 64
 
 
 def utcnow() -> datetime:
