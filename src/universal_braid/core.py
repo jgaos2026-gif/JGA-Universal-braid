@@ -155,18 +155,7 @@ def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, An
     if challenge.get("destination_node") != identity.node_id:
         raise ValueError("challenge destination mismatch")
     ledger = EvidenceLedger(root / "evidence.jsonl")
-    records = ledger.records()
     session_id = response.get("session_id")
-    if any(
-        record.get("event") == "handshake.response.verify"
-        and record.get("outcome") == "PASS"
-        and record.get("details", {}).get("session_id") == session_id
-        for record in records
-    ):
-        ledger.append("handshake.response.verify", "FAIL", {
-            "session_id": session_id, "peer_node": peer["node_id"], "reason": "replay"
-        })
-        raise ValueError("handshake replay refused")
     _verify_signed_handshake(response, peer, identity.node_id, "HANDSHAKE_RESPONSE")
     if response.get("session_id") != challenge.get("session_id"):
         raise ValueError("handshake session mismatch")
@@ -181,13 +170,17 @@ def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, An
         "connection": "OFFLINE", "certification": "NOT_GRANTED",
         "reason": "PENDING_INDEPENDENT_TRIAD",
     }
+    accepted = ledger.append_once(
+        "handshake.response.verify",
+        {"session_id": session_id, "peer_node": peer["node_id"]},
+        {"session_id": session_id, "peer_node": peer["node_id"],
+         "peer_fingerprint": peer["fingerprint"]}
+    )
+    if not accepted:
+        raise ValueError("handshake replay refused")
     path = root / "verifications" / f'{peer["node_id"]}.json'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    ledger.append("handshake.response.verify", "PASS", {
-        "session_id": session_id, "peer_node": peer["node_id"],
-        "peer_fingerprint": peer["fingerprint"]
-    })
     return result
 
 @dataclass(frozen=True)
@@ -420,7 +413,13 @@ class Verifier:
             if message_id in self.seen or nonce in self.seen_nonces: raise ValueError("replay")
             pub = Ed25519PublicKey.from_public_bytes(unb64(self.peer["public_key"]))
             pub.verify(signature, canonical(unsigned))
-            self.ledger.append("envelope.verify", "PASS", {"message_id": message_id, "nonce": nonce})
+            accepted = self.ledger.append_once(
+                "envelope.verify",
+                {"message_id": message_id, "nonce": nonce},
+                {"message_id": message_id, "nonce": nonce}
+            )
+            if not accepted:
+                raise ValueError("replay")
             self.seen.add(message_id)
             self.seen_nonces.add(nonce)
             return True
