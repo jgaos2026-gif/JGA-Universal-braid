@@ -148,8 +148,24 @@ def respond_to_handshake(identity: Identity, peer: dict[str, Any], challenge: di
 
 def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, Any],
                               challenge: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    peer = validate_public_identity(peer)
     if challenge.get("source_node") != identity.node_id:
         raise ValueError("challenge was not issued by this node")
+    if challenge.get("destination_node") != identity.node_id:
+        raise ValueError("challenge destination mismatch")
+    ledger = EvidenceLedger(root / "evidence.jsonl")
+    records = ledger.records()
+    session_id = response.get("session_id")
+    if any(
+        record.get("event") == "handshake.response.verify"
+        and record.get("outcome") == "PASS"
+        and record.get("details", {}).get("session_id") == session_id
+        for record in records
+    ):
+        ledger.append("handshake.response.verify", "FAIL", {
+            "session_id": session_id, "peer_node": peer["node_id"], "reason": "replay"
+        })
+        raise ValueError("handshake replay refused")
     _verify_signed_handshake(response, peer, identity.node_id, "HANDSHAKE_RESPONSE")
     if response.get("session_id") != challenge.get("session_id"):
         raise ValueError("handshake session mismatch")
@@ -158,21 +174,20 @@ def verify_handshake_response(root: Path, identity: Identity, peer: dict[str, An
     if response.get("challenge_hash") != sha256(canonical(challenge)):
         raise ValueError("handshake challenge mismatch")
     result = {
-        "protocol": PROTOCOL,
-        "peer_node": peer["node_id"],
-        "peer_fingerprint": peer["fingerprint"],
-        "session_id": response["session_id"],
-        "verified_at": iso(utcnow()),
-        "authentication": "MUTUALLY_VERIFIED",
-        "connection": "OFFLINE",
-        "certification": "NOT_GRANTED",
+        "protocol": PROTOCOL, "peer_node": peer["node_id"],
+        "peer_fingerprint": peer["fingerprint"], "session_id": session_id,
+        "verified_at": iso(utcnow()), "authentication": "MUTUALLY_VERIFIED",
+        "connection": "OFFLINE", "certification": "NOT_GRANTED",
         "reason": "PENDING_INDEPENDENT_TRIAD",
     }
     path = root / "verifications" / f'{peer["node_id"]}.json'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    ledger.append("handshake.response.verify", "PASS", {
+        "session_id": session_id, "peer_node": peer["node_id"],
+        "peer_fingerprint": peer["fingerprint"]
+    })
     return result
-
 
 @dataclass(frozen=True)
 class Identity:
@@ -226,28 +241,34 @@ def create_identity(root: Path, node_id: str, epoch: int = 1) -> Identity:
 
 
 def load_identity(root: Path) -> Identity:
-    record = json.loads((root / "identity.json").read_text())
+    record = validate_public_identity(json.loads((root / "identity.json").read_text(encoding="utf-8")))
     key = serialization.load_pem_private_key((root / "identity.pem").read_bytes(), password=None)
     if not isinstance(key, Ed25519PrivateKey):
         raise ValueError("identity key type is not Ed25519")
-    identity = Identity(record["node_id"], int(record["identity_epoch"]), key)
-    if identity.fingerprint != record["fingerprint"]:
-        raise ValueError("identity fingerprint mismatch")
+    identity = Identity(record["node_id"], record["identity_epoch"], key)
+    if identity.public_record() != record:
+        raise ValueError("local identity record does not match private key")
     return identity
-
 
 class EvidenceLedger:
     def __init__(self, path: Path):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
 
+    def records(self) -> list[dict[str, Any]]:
+        if not self.verify():
+            raise ValueError("EVIDENCE_LEDGER_CORRUPT: refusing to read unverified history")
+        if not self.path.exists():
+            return []
+        return [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
     def head(self) -> str:
-        if not self.path.exists() or not self.path.stat().st_size:
-            return "0" * 64
-        last = self.path.read_text().splitlines()[-1]
-        return json.loads(last)["entry_hash"]
+        records = self.records()
+        return records[-1]["entry_hash"] if records else "0" * 64
 
     def append(self, event: str, outcome: str, details: dict[str, Any]) -> dict[str, Any]:
+        if not self.verify():
+            raise ValueError("EVIDENCE_LEDGER_CORRUPT: refusing append")
         record = {
             "event_id": str(uuid.uuid4()), "created_at": iso(utcnow()),
             "event": event, "outcome": outcome, "details": details,
@@ -264,14 +285,23 @@ class EvidenceLedger:
         previous = "0" * 64
         if not self.path.exists():
             return True
-        for line in self.path.read_text().splitlines():
-            record = json.loads(line)
-            claimed = record.pop("entry_hash")
-            if record["previous_hash"] != previous or sha256(canonical(record)) != claimed:
-                return False
-            previous = claimed
-        return True
-
+        try:
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    return False
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    return False
+                claimed = record.get("entry_hash")
+                unsigned = {key: value for key, value in record.items() if key != "entry_hash"}
+                if not isinstance(claimed, str) or unsigned.get("previous_hash") != previous:
+                    return False
+                if sha256(canonical(unsigned)) != claimed:
+                    return False
+                previous = claimed
+            return True
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            return False
 
 def sign_envelope(identity: Identity, destination: str, session_id: str, payload: Any,
                   branch: str = "control-room", family: str = "INTEG",
@@ -295,12 +325,21 @@ def sign_envelope(identity: Identity, destination: str, session_id: str, payload
 class Verifier:
     def __init__(self, local_node: str, peer_record: dict[str, Any], ledger: EvidenceLedger):
         self.local_node = local_node
-        self.peer = peer_record
+        self.peer = validate_public_identity(peer_record)
         self.ledger = ledger
-        self.seen: set[str] = set()
+        records = ledger.records()
+        self.seen: set[str] = {
+            str(record.get("details", {}).get("message_id"))
+            for record in records
+            if record.get("event") == "envelope.verify" and record.get("outcome") == "PASS"
+        }
+        self.seen_nonces: set[str] = {
+            str(record.get("details", {}).get("nonce"))
+            for record in records
+            if record.get("event") == "envelope.verify" and record.get("outcome") == "PASS"
+        }
 
     def verify(self, envelope: dict[str, Any], now: datetime | None = None) -> bool:
-        reason = "accepted"
         try:
             unsigned = dict(envelope)
             signature = unb64(unsigned.pop("signature"))
@@ -308,23 +347,33 @@ class Verifier:
             if unsigned.get("destination_node") != self.local_node: raise ValueError("wrong_destination")
             if unsigned.get("source_node") != self.peer["node_id"]: raise ValueError("wrong_source")
             if unsigned.get("signer_fingerprint") != self.peer["fingerprint"]: raise ValueError("wrong_fingerprint")
+            if unsigned.get("identity_epoch") != self.peer["identity_epoch"]: raise ValueError("wrong_identity_epoch")
             if unsigned.get("branch") not in ALLOWED_BRANCHES: raise ValueError("wrong_scope")
             if unsigned.get("family") not in ALLOWED_FAMILIES: raise ValueError("wrong_family")
             if sha256(canonical(unsigned.get("payload"))) != unsigned.get("payload_hash"): raise ValueError("altered_payload")
             check_time = now or utcnow()
             if parse_iso(unsigned["created_at"]) > check_time + timedelta(seconds=5): raise ValueError("future_message")
             if parse_iso(unsigned["expires_at"]) < check_time: raise ValueError("expired")
-            if unsigned["message_id"] in self.seen: raise ValueError("replay")
+            message_id = unsigned.get("message_id")
+            nonce = unsigned.get("nonce")
+            if not isinstance(message_id, str) or not message_id: raise ValueError("missing_message_id")
+            if not isinstance(nonce, str) or not nonce: raise ValueError("missing_nonce")
+            if message_id in self.seen or nonce in self.seen_nonces: raise ValueError("replay")
             pub = Ed25519PublicKey.from_public_bytes(unb64(self.peer["public_key"]))
             pub.verify(signature, canonical(unsigned))
-            self.seen.add(unsigned["message_id"])
-            self.ledger.append("envelope.verify", "PASS", {"message_id": unsigned["message_id"]})
+            self.ledger.append("envelope.verify", "PASS", {"message_id": message_id, "nonce": nonce})
+            self.seen.add(message_id)
+            self.seen_nonces.add(nonce)
             return True
         except Exception as exc:
             reason = str(exc) or type(exc).__name__
-            self.ledger.append("envelope.verify", "FAIL", {"message_id": envelope.get("message_id"), "reason": reason})
+            try:
+                self.ledger.append("envelope.verify", "FAIL", {
+                    "message_id": envelope.get("message_id"), "reason": reason
+                })
+            except (OSError, ValueError):
+                pass
             return False
-
 
 def sign_challenge(identity: Identity, nonce: str) -> dict[str, str]:
     body = canonical({"protocol": PROTOCOL, "node_id": identity.node_id, "nonce": nonce})
